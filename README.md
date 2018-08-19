@@ -7,22 +7,18 @@ While trying to optimize futex use I discovered
 that entire loops can be optimized away and performance
 was 10x slower for release modes as compared to debug mode.
 
-Here is how I compile & test in debug mode and then use objdump to disassemble test.
-As you can see it took about 3s to complete 20,000,000 incrments of gCounter using two threads.
-Also, note futex_wait counts=0 and futex_wake counts=11.
+Here is the debug run:
 ```
 $ zig test futex.zig
 Test 1/1 Futex...
 test Futex:+
-test Futex: time=2.824703
-test Futex:- futex_wait counts=0 futex_wake counts=11
+test Futex: time=2.735254
+test Futex:- futex_wait counts=117 futex_wake counts=275
 OK
 All tests passed.
-
-$ objdump --source -d -M intel ./zig-cache/test > futex.debug.asm
 ```
 
-Next I compile & test in release-fast mode. Here it takes about 25s to complete the 20,000,000 increments.
+Here it takes about 25s in release-fast mode to complete the 20,000,000 increments.
 The reason is the huge number of calls to the kernel, there were 11million futex_wait's and 20million
 futex_wake's.
 ```
@@ -37,7 +33,7 @@ All tests passed.
 $ objdump --source -d -M intel ./zig-cache/test > futex.fast.asm
 ```
 
-As eluided to above the reason for the huge number of futex wake/wait calls is the "Stall" loops are
+As eluided to above the reason for the huge number of futex wake/wait calls is because the "Stall" loops are
 being optimized away in futex.zig producer and consuer fn's.  As an example here is the
 source for the begining of producer:
 ```
@@ -182,3 +178,76 @@ pub fn syscall4(number: usize, arg1: usize, arg2: usize, arg3: usize, arg4: usiz
 ```
 
 I did try to create a simpler example, loop_opt.zig, but was unsuccessful as it wasn't over optimized.
+
+# A solution
+A solution is to convert the stall code to fn's.
+
+We now see sub 3s performance with --release-fast:
+```
+$ zig test --release-fast futex.zig
+Test 1/1 Futex...
+test Futex:+
+test Futex: time=2.835345
+test Futex:- futex_wait counts=8 futex_wake counts=56
+OK
+All tests passed.
+```
+
+And below we see that the "Stall" loop is included:
+```
+000000000020b7d0 <MainFuncs_linuxThreadMain>:
+            const arg = if (@sizeOf(Context) == 0) {} else @intToPtr(*const Context, ctx_addr).*;
+  20b7d0:	4c 8b 07             	mov    r8,QWORD PTR [rdi]
+    while (pContext.counter < max_counter) {
+  20b7d3:	b8 7f 96 98 00       	mov    eax,0x98967f
+  20b7d8:	31 c9                	xor    ecx,ecx
+  20b7da:	49 3b 00             	cmp    rax,QWORD PTR [r8]
+  20b7dd:	49 8b 40 08          	mov    rax,QWORD PTR [r8+0x8]
+  20b7e1:	48 19 c1             	sbb    rcx,rax
+  20b7e4:	0f 82 0c 01 00 00    	jb     20b8f6 <MainFuncs_linuxThreadMain+0x126>
+  20b7ea:	48 8d 3d 47 58 01 00 	lea    rdi,[rip+0x15847]        # 221038 <produce>
+  20b7f1:	66 66 66 66 66 66 2e 	data16 data16 data16 data16 data16 nop WORD PTR cs:[rax+rax*1+0x0]
+  20b7f8:	0f 1f 84 00 00 00 00
+  20b7ff:	00
+    var val = @atomicLoad(u32, pValue, AtomicOrder.Acquire);
+  20b800:	8b 05 32 58 01 00    	mov    eax,DWORD PTR [rip+0x15832]        # 221038 <produce>
+    while ((val == desiredValue) and (count > 0)) {
+  20b806:	85 c0                	test   eax,eax
+  20b808:	75 36                	jne    20b840 <MainFuncs_linuxThreadMain+0x70>
+  20b80a:	48 c7 c1 f1 d8 ff ff 	mov    rcx,0xffffffffffffd8f1
+  20b811:	66 66 66 66 66 66 2e 	data16 data16 data16 data16 data16 nop WORD PTR cs:[rax+rax*1+0x0]
+  20b818:	0f 1f 84 00 00 00 00
+  20b81f:	00
+        val = @atomicLoad(u32, pValue, AtomicOrder.Acquire);
+  20b820:	8b 05 12 58 01 00    	mov    eax,DWORD PTR [rip+0x15812]        # 221038 <produce>
+    while ((val == desiredValue) and (count > 0)) {
+  20b826:	48 85 c9             	test   rcx,rcx
+  20b829:	74 15                	je     20b840 <MainFuncs_linuxThreadMain+0x70>
+  20b82b:	48 83 c1 01          	add    rcx,0x1
+  20b82f:	85 c0                	test   eax,eax
+  20b831:	74 ed                	je     20b820 <MainFuncs_linuxThreadMain+0x50>
+  20b833:	66 66 66 66 2e 0f 1f 	data16 data16 data16 nop WORD PTR cs:[rax+rax*1+0x0]
+  20b83a:	84 00 00 00 00 00
+        while (produce_val != produceSignal) {
+  20b840:	83 f8 01             	cmp    eax,0x1
+  20b843:	74 2a                	je     20b86f <MainFuncs_linuxThreadMain+0x9f>
+  20b845:	66 66 2e 0f 1f 84 00 	data16 nop WORD PTR cs:[rax+rax*1+0x0]
+  20b84c:	00 00 00 00
+            gProducer_wait_count += 1;
+  20b850:	48 83 05 a8 57 01 00 	add    QWORD PTR [rip+0x157a8],0x1        # 221000 <gProducer_wait_count>
+  20b857:	01
+        : "rcx", "r11"
+    );
+}
+
+pub fn syscall4(number: usize, arg1: usize, arg2: usize, arg3: usize, arg4: usize) usize {
+    return asm volatile ("syscall"
+  20b858:	b8 ca 00 00 00       	mov    eax,0xca
+  20b85d:	31 f6                	xor    esi,esi
+  20b85f:	31 d2                	xor    edx,edx
+  20b861:	45 31 d2             	xor    r10d,r10d
+  20b864:	0f 05                	syscall
+      while (produce_val != produceSignal) {
+  20b866:	83 3d cb 57 01 00 01 	cmp    DWORD PTR [rip+0x157cb],0x1        # 221038 <produce>
+  20b86d:	75 e1                	jne    20b850 <MainFuncs_linuxThreadMain+0x80>
+```

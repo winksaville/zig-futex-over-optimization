@@ -22,12 +22,12 @@ pub use switch(builtin.arch) {
 
 
 
-pub fn futex_wait(pVal: *i32, expected_value: u32) void {
+pub fn futex_wait(pVal: *u32, expected_value: u32) void {
     //warn("futex_wait: {*}\n", pVal);
     _ = syscall4(SYS_futex, @ptrToInt(pVal), linux.FUTEX_WAIT, expected_value, 0);
 }
 
-pub fn futex_wake(pVal: *i32, num_threads_to_wake: u32) void {
+pub fn futex_wake(pVal: *u32, num_threads_to_wake: u32) void {
     //warn("futex_wake: {*}\n", pVal);
     _ = syscall4(SYS_futex, @ptrToInt(pVal), linux.FUTEX_WAKE, num_threads_to_wake, 0);
 }
@@ -48,7 +48,7 @@ var gConsumer_context: ThreadContext = undefined;
 
 const consumeSignal = 0;
 const produceSignal = 1;
-var produce: i32 = consumeSignal;
+var produce: u32 = consumeSignal;
 var gCounter: u64 = 0;
 var gProducer_wait_count: u64 = 0;
 var gConsumer_wait_count: u64 = 0;
@@ -59,16 +59,31 @@ const max_counter = 10000000;
 const stallCountWait: u32 = 10000;
 const stallCountWake: u32 = 2000;
 
+fn stallWhileNotDesiredVal(stallCount: u64, pValue: *u32, desiredValue: u32) u32 {
+    var count = stallCount;
+    var val = @atomicLoad(u32, pValue, AtomicOrder.Acquire);
+    while ((val != desiredValue) and (count > 0)) {
+        val = @atomicLoad(u32, pValue, AtomicOrder.Acquire);
+        count -= 1;
+    }
+    return val;
+}
+
+fn stallWhileDesiredVal(stallCount: u64, pValue: *u32, desiredValue: u32) u32 {
+    var count = stallCount;
+    var val = @atomicLoad(u32, pValue, AtomicOrder.Acquire);
+    while ((val == desiredValue) and (count > 0)) {
+        val = @atomicLoad(u32, pValue, AtomicOrder.Acquire);
+        count -= 1;
+    }
+    return val;
+}
+
 fn producer(pContext: *ThreadContext) void {
     while (pContext.counter < max_counter) {
         // Stall to see if the consumer changes produce to produceSignal
-        var count = stallCountWait;
-        var produce_val = @atomicLoad(@typeOf(produce), &produce, AtomicOrder.SeqCst);
-        while ((produce_val != produceSignal) and (count > 0)) {
-            produce_val = @atomicLoad(@typeOf(produce), &produce, AtomicOrder.SeqCst);
-            count -= 1;
-        }
         // If consumer hasn't changed it call futex_wait until it does
+        var produce_val = stallWhileDesiredVal(stallCountWait, &produce, consumeSignal);
         while (produce_val != produceSignal) {
             gProducer_wait_count += 1;
             futex_wait(&produce, consumeSignal);
@@ -83,12 +98,7 @@ fn producer(pContext: *ThreadContext) void {
         _ = @atomicRmw(@typeOf(produce), &produce, AtomicRmwOp.Xchg, consumeSignal, AtomicOrder.SeqCst);
 
         // Stall to see if consumer changes produce to produceSignal
-        count = stallCountWake;
-        produce_val = @atomicLoad(@typeOf(produce), &produce, AtomicOrder.SeqCst);
-        while ((produce_val != produceSignal) and (count > 0)) {
-            produce_val = @atomicLoad(@typeOf(produce), &produce, AtomicOrder.SeqCst);
-            count -= 1;
-        }
+        produce_val = stallWhileDesiredVal(stallCountWait, &produce, consumeSignal);
         // If consumer hasn't changed it call futex_wake and continue
         if (produce_val != produceSignal) {
             gProducer_wake_count += 1;
@@ -103,12 +113,7 @@ fn consumer(pContext: *ThreadContext) void {
         _ = @atomicRmw(@typeOf(produce), &produce, AtomicRmwOp.Xchg, produceSignal, AtomicOrder.SeqCst);
 
         // Stall to see if the producer changes produce to consumeSignal
-        var count = stallCountWake;
-        var produce_val = @atomicLoad(@typeOf(produce), &produce, AtomicOrder.SeqCst);
-        while ((produce_val != consumeSignal) and (count > 0)) {
-            produce_val = @atomicLoad(@typeOf(produce), &produce, AtomicOrder.SeqCst);
-            count -= 1;
-        }
+        var produce_val = stallWhileNotDesiredVal(stallCountWait, &produce, consumeSignal);
         // If producer hasn't changed it call futex_wake and continue
         if (produce_val != consumeSignal) {
             gConsumer_wake_count += 1;
@@ -116,12 +121,8 @@ fn consumer(pContext: *ThreadContext) void {
         }
 
         // Stall to see if the producer changes produce to consumeSignal
-        count = stallCountWait;
-        produce_val = @atomicLoad(@typeOf(produce), &produce, AtomicOrder.SeqCst);
-        while ((produce_val != consumeSignal) and (count > 0)) {
-            produce_val = @atomicLoad(@typeOf(produce), &produce, AtomicOrder.SeqCst);
-            count -= 1;
-        }
+        produce_val = stallWhileNotDesiredVal(stallCountWait, &produce, consumeSignal);
+
         // If producer hasn't changed it call futex_wait until it does
         while (produce_val != consumeSignal) {
             gConsumer_wait_count += 1;
