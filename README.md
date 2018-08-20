@@ -179,8 +179,8 @@ pub fn syscall4(number: usize, arg1: usize, arg2: usize, arg3: usize, arg4: usiz
 
 I did try to create a simpler example, loop_opt.zig, but was unsuccessful as it wasn't over optimized.
 
-# A solution
-A solution is to convert the stall code to fn's.
+# A workaround
+A workaround is to convert the stall code to fn's.
 
 We now see sub 3s performance with --release-fast:
 ```
